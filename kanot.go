@@ -1,0 +1,4 @@
+package kanot
+
+func Foo() {
+}
