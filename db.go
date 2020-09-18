@@ -22,20 +22,63 @@ import (
 	"context"
 	"math"
 	"math/big"
+	"time"
 	
 	"github.com/ethereum/go-ethereum/log"
 	
-	"github.com/jackc/pgx/v4"
+	//"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-const (
-      dbConnString = "host=127.0.0.1 port=5432 dbname=dev1 user=kanot password=kanot"
-)
+func setupDBConn() *pgxpool.Conn {
+	config, err := pgxpool.ParseConfig(dbConnString)
+	if err != nil {
+		log.Error("pgxpool.ParseConfig", "err", err)
+		panic(err)
+	}
+	
+	hours, _ := time.ParseDuration(pgxMaxConnTime)
+	config.MaxConnLifetime = hours
+	config.MaxConnIdleTime = hours
+	
+	config.MaxConns = pgxMaxConns
+	
+	dbPool, err := pgxpool.ConnectConfig(context.Background(), config)
+	if err != nil {
+		log.Error("pgxpool.Connect", "err", err)
+		panic(err)
+	} else {
+		log.Info("pgxpool.Connect OK")
+	}
+	
+	dbConn, err := dbPool.Acquire(context.Background())
+	if err != nil {
+		log.Error("pgxpool.Pool.Acquire", "err", err)
+		panic(err)
+	}
 
-var (
-	dbConn *pgx.Conn
-)
+	return dbConn
+}
+
+type DBExec struct {
+	sql string
+	args []interface{}
+}
+
+func dbHandler(dbConn *pgxpool.Conn, ch <-chan DBExec) {
+	for e := range ch {
+		t0 := time.Now()
+		cmdTag, err := dbConn.Exec(context.Background(), e.sql, e.args...)
+		if err != nil {
+			log.Error("dbConn.Exec", "err", err)
+		} else {
+			t1 := time.Since(t0)
+			log.Info("dbConn.Exec OK", "cmdtag", cmdTag, "t", t1)
+		}
+	}
+	
+	dbConn.Release()
+}
 
 func insertTransfer(dbConn *pgxpool.Conn, pair UniswapPair, ts uint64, tx_hash, from, to string, value *big.Int) {
 	//log.Info("insertTransfer", "dbConn.IsClosed()", dbConn.IsClosed())

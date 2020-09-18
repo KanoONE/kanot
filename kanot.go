@@ -19,7 +19,4 @@
 package kanot
 
 import(
-	"os"
-	
-	"github.com/ethereum/go-ethereum/log"
 )

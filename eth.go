@@ -19,9 +19,8 @@
 package kanot
 
 import (
-	"time"
 	"context"
-	"strings"
+	"time"
 	"math/big"
 	
 	"github.com/ethereum/go-ethereum"
@@ -29,123 +28,190 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 
-	"github.com/jackc/pgx/v4/pgxpool"
+	//"github.com/jackc/pgx/v4/pgxpool"
 )
 
 const (
+	//
+	// Ethereum
+	//
+	// websocket endpoint of Ethereum full node
 	endpoint = "ws://127.0.0.1:13516"
-	subChanSize = 1024
+
+	// number of blocks for high guarantee of no reorgs
+	blockConfirmations = 30 // around 6 minutes
+
+	//
+	// PostgreSQL
+	//
+	dbConnString = "host=127.0.0.1 port=5432 dbname=dev1 user=kanot password=kanot"
+
+	// used for both pgxpool.Config.MaxConnLifetime and pgxpool.Config.MaxConnIdleTime
+	// TODO: for now set high so conns are open indefinitely
+	pgxMaxConnTime = "876000h" // 100 years
+
+	// TODO: increase when we implement concurrent inserts
+	pgxMaxConns = 1
+
+	//
+	// Performance Tuning
+	//
+
+	// TODO: block count per request & reasonable context timeout
+	// TODO: launch go routines for each set of block range requests,
+	//       send results on channel to DB inserter routine
+	queryBlockCount = 664 //6646*1 // ~1 day worth of blocks
+	queryTimeout = 120 * time.Second
+
+	bufSizeDBExecChan = 64
 )
 
-var (
-	usPairABI abi.ABI
-)
-
-type UniswapPair struct {
-	token1, token2 string
-	addr string
-}
-
-func (up *UniswapPair) DBTableName(eventName string) string {
-	return "us_" + up.token1 + "_" + up.token2 + "_" + eventName
-}
-
-func init() {
-	// load ABI
-	var err error
-	usPairABI, err = abi.JSON(strings.NewReader(uniswapPairABI))
-	if err != nil {
-		log.Error("abi.JSON", "err", err)
-		panic(err)
-	}
-}
-
-func StreamETH() {
-	config, err := pgxpool.ParseConfig(dbConnString)
-	if err != nil {
-		log.Error("pgxpool.ParseConfig", "err", err)
-		panic(err)
-	}
-	hours, _ := time.ParseDuration("168h")
-	config.MaxConnLifetime = hours
-	config.MaxConnIdleTime = hours
-	config.MaxConns = 10
+func SyncETH() {
+	dbConn := setupDBConn()
+	//defer dbConn.Release()
 	
-	dbPool, err := pgxpool.ConnectConfig(context.Background(), config)
-	if err != nil {
-		log.Error("pgxpool.Connect", "err", err)
-		panic(err)
-	} else {
-		log.Info("pgxpool.Connect OK")
-		//defer dbConn.Close(context.Background())
-	}
-
-	pairs := []UniswapPair{
-		UniswapPair{"USDC", "ETH", "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"},
-		UniswapPair{"ETH", "USDT", "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852"},
-		UniswapPair{"DAI", "ETH", "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11"},
-		UniswapPair{"YFI", "ETH", "0x2fDbAdf3C4D5A8666Bc06645B8358ab803996E28"},
-		UniswapPair{"SUSHI", "ETH", "0xce84867c3c02b05dc570d0135103d3fb9cc19433"},
-		UniswapPair{"LINK", "ETH", "0xa2107fa5b38d9bbd2c461d6edf11b11a50f6b974"},
-	}
-	
-	for i := 0; i < len(pairs); i++ {
-		p := pairs[i]
-
-		dbConn, err := dbPool.Acquire(context.Background())
-		if err != nil {
-			log.Error("pgxpool.Pool.Acquire", "err", err)
-			panic(err)
-		}
-		
-		go func() {
-			stream(p, dbConn)
-		}()
-	}
-}
-
-func stream(pair UniswapPair, dbConn *pgxpool.Conn) {
 	// https://godoc.org/github.com/ethereum/go-ethereum/ethclient
 	client, err := ethclient.Dial(endpoint)
 	if err != nil {
      	log.Error("rpc.Dial", "err", err)
 		return
 	}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	
-	// https://godoc.org/github.com/ethereum/go-ethereum#FilterQuery
-	fq := ethereum.FilterQuery{
-		BlockHash: nil,
-		FromBlock: nil,
-		ToBlock: nil,
-		Addresses: []common.Address{common.HexToAddress(pair.addr)},
+
+	eventSyncs := []EventSync{
+		&UniswapFactory{},
 	}
-	
-	ch := make(chan types.Log, subChanSize)
-	
-	sub, err := client.SubscribeFilterLogs(ctx, fq, ch)
+
+	latestHeader, err := client.HeaderByNumber(context.Background(), nil)
 	if err != nil {
-		log.Error("ethclient.SubscribeFilterLogs", "err", err)
+		log.Error("client.HeaderByNumber", "err", err)
 		return
 	}
-	defer sub.Unsubscribe()
 
-	log.Info("Streaming Uniswap V2", "pair", pair.token1 + "-" + pair.token2, "addr", pair.addr)
+	ch := make(chan DBExec, bufSizeDBExecChan)
+	go dbHandler(dbConn, ch)
+
+	for _, es := range eventSyncs {
+		go syncEvent(ch, es, latestHeader.Number.Uint64())
+	}
+
+}
+
+func syncEvent(ch chan<- DBExec, es EventSync, lastBlockNum uint64) {
+	insertQuery := es.DBInsertQuery()
+	contractABI := es.ContractABI()
+	eventName := es.EventName()
+	logDataTypes := es.LogDataNamesAndTypes()
+	
+	client, err := ethclient.Dial(endpoint)
+	if err != nil {
+     	log.Error("rpc.Dial", "err", err)
+		return
+	}
+	
+	addrs := []common.Address{es.ContractAddr()}
+	logs := make([]types.Log, 0)
+
+	var fromBlock uint64
+	toBlock := es.ContractCreateBlock() - 1
+	maxBlock := lastBlockNum - blockConfirmations
+	
+	for {
+		fromBlock = toBlock + 1
+		toBlock = fromBlock + queryBlockCount
+		if toBlock > maxBlock {
+			toBlock = maxBlock
+		}
+
+		// https://godoc.org/github.com/ethereum/go-ethereum#FilterQuery
+		fq := ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(fromBlock),
+			ToBlock: new(big.Int).SetUint64(toBlock),
+			Addresses: addrs}
+
+		
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		defer cancel()
+
+		t0 := time.Now()
+		logs1, err := client.FilterLogs(ctx, fq)
+		if err != nil {
+			log.Error("ethclient.FilterLogs", "err", err)
+			return
+		}
+		t1 := time.Since(t0)
+		
+		logs = append(logs, logs1...)
+		
+		log.Info("syncEvent", "fromBlock", fromBlock, "toBlock", toBlock, "logs", len(logs1), "total", len(logs), "t", t1)
+
+		for _, l := range logs1 {
+			//log.Info("log", "l", l)
+			
+			args := make([]interface{}, 0)
+			for i, _ := range es.LogTopicNames() {
+				addr := common.HexToAddress(l.Topics[i+1].Hex())
+				args = append(args, addr.Hex())
+			}
+
+			m := make(map[string]interface{})
+			err = contractABI.UnpackIntoMap(m, eventName, l.Data)
+			if err != nil {
+				log.Error("ABI.Unpack", "err", err, "l", l)
+				return
+			}
+			//log.Info("log", "m", m)
+			i := 0
+			for i < len(logDataTypes) {
+				if logDataTypes[i+1] == "address" {
+					a := m[logDataTypes[i]].(common.Address)
+					args = append(args, a.Hex())
+				} else {
+					//f := BigToFloat(m[logDataTypes[i]].(*big.Int))
+					b := m[logDataTypes[i]].(*big.Int)
+					args = append(args, b.Uint64())
+				}
+				i += 2
+			}
+
+			log.Info("args", "len", len(args))
+			ch <- DBExec{insertQuery, args}
+			
+		}
+
+		if toBlock == maxBlock {
+			break
+		}
+	}
+}
+
+	
+	
+	/*
+	//log.Info("Streaming Uniswap V2", "pair", pair.token1 + "-" + pair.token2, "addr", pair.addr)
 	for l := range ch {
-		// get block timestamp
 		h, err := client.HeaderByHash(context.Background(), l.BlockHash)
 		if err != nil {
 			log.Error("client.HeaderByHash", "err", err)
 			return
 		}
-		handleEvent(l, h.Time, pair, dbConn)
-	}
-}
 
+		token0 := common.HexToAddress(l.Topics[1].Hex())
+		token1 := common.HexToAddress(l.Topics[1].Hex())
+
+		m := make(map[string]interface{})
+		err = usPairABI.UnpackIntoMap(m, "PairCreated", l.Data)
+		if err != nil {
+			log.Error("ABI.Unpack", "err", err, "l", l)
+			return
+		}
+
+		pairAddr := m["pair"].(common.Address)
+	
+	}
+*/
+
+/*
 // Unpack events from their data and/or topics.  See solidity docs on indexing:
 // https://solidity.readthedocs.io/en/v0.7.1/contracts.html#events
 // And go-ethereum docs on event reading:
@@ -220,8 +286,11 @@ func handleEvent(l types.Log, blockTime uint64, pair UniswapPair, dbConn *pgxpoo
 			"amount0Out", m["amount0Out"],
 			"amount1Out", m["amount1Out"])
 */
+
+/*
 		a0In, a1In, a0Out, a1Out := m["amount0In"].(*big.Int), m["amount1In"].(*big.Int), m["amount0Out"].(*big.Int), m["amount1Out"].(*big.Int)
 		insertSwap(dbConn, pair, blockTime, l.TxHash.Hex(), tm["sender"].Hex(), tm["to"].Hex(), a0In, a1In, a0Out, a1Out)
 	}
 	//log.Info("Unpacked:", "name", eventName, "topics", tm2, "data", m)
 }
+*/

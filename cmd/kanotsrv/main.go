@@ -39,7 +39,7 @@ func init() {
 func main() {
 	app := cli.NewApp()
 	app.Name = "kanot"
-	app.Version = "0.0.1-unstable"
+	app.Version = "0.0.2-unstable"
 	app.Usage = ""
 
 	app.Flags = []cli.Flag{
@@ -57,7 +57,7 @@ func main() {
 		}()
 		
 		log.Info("Kano Terminal Server", "version", app.Version)
-		kanot.StreamETH()
+		kanot.SyncETH()
 		
 		<-done
 		log.Info("shutting down...")
