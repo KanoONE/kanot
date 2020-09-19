@@ -57,29 +57,43 @@ const (
 	//
 	// Performance Tuning
 	//
-
-	// TODO: block count per request & reasonable context timeout
-	// TODO: launch go routines for each set of block range requests,
-	//       send results on channel to DB inserter routine
-	queryBlockCount = 664 //6646*1 // ~1 day worth of blocks
+	pollingCycle = 600 * time.Second
+	
+	queryBlockCount = 2048 //6646*1 // ~1 day worth of blocks
 	queryTimeout = 120 * time.Second
-
-	bufSizeDBExecChan = 64
 )
 
 func SyncETH() {
-	dbConn := setupDBConn()
-	//defer dbConn.Release()
+	initDBPool()
 	
-	// https://godoc.org/github.com/ethereum/go-ethereum/ethclient
+	usFactory := UniswapV2FactoryPairCreated()
+	
+	eventSyncs := []*EventSync{
+		usFactory,
+	}
+
+	for _, es := range eventSyncs {
+		go func() {
+			for {
+				log.Info("Syncing", "eventName", es.EventName)
+				syncEvent(es)
+				time.Sleep(pollingCycle)
+			}
+		}()
+	}
+
+	// TODO: go routine for all pairs:
+	//usPair := UniswapV2Pair(pairTicker, addr, createBlock, eventName)
+
+}
+
+func syncEvent(es *EventSync) {
+	lastInsertedBlock := dbQueryUint64(es.DBBlockQuery, []interface{}{})
+	
 	client, err := ethclient.Dial(endpoint)
 	if err != nil {
      	log.Error("rpc.Dial", "err", err)
 		return
-	}
-
-	eventSyncs := []EventSync{
-		&UniswapFactory{},
 	}
 
 	latestHeader, err := client.HeaderByNumber(context.Background(), nil)
@@ -87,34 +101,16 @@ func SyncETH() {
 		log.Error("client.HeaderByNumber", "err", err)
 		return
 	}
-
-	ch := make(chan DBExec, bufSizeDBExecChan)
-	go dbHandler(dbConn, ch)
-
-	for _, es := range eventSyncs {
-		go syncEvent(ch, es, latestHeader.Number.Uint64())
-	}
-
-}
-
-func syncEvent(ch chan<- DBExec, es EventSync, lastBlockNum uint64) {
-	insertQuery := es.DBInsertQuery()
-	contractABI := es.ContractABI()
-	eventName := es.EventName()
-	logDataTypes := es.LogDataNamesAndTypes()
 	
-	client, err := ethclient.Dial(endpoint)
-	if err != nil {
-     	log.Error("rpc.Dial", "err", err)
-		return
-	}
-	
-	addrs := []common.Address{es.ContractAddr()}
-	logs := make([]types.Log, 0)
+	var fromBlock, toBlock uint64
+	maxBlock := latestHeader.Number.Uint64() - blockConfirmations
 
-	var fromBlock uint64
-	toBlock := es.ContractCreateBlock() - 1
-	maxBlock := lastBlockNum - blockConfirmations
+	// toBlock is used as fromBlock in first iteration
+	if lastInsertedBlock == 0 {
+		toBlock = es.ContractCreateBlock - 1
+	} else {
+		toBlock = lastInsertedBlock
+	}
 	
 	for {
 		fromBlock = toBlock + 1
@@ -123,67 +119,76 @@ func syncEvent(ch chan<- DBExec, es EventSync, lastBlockNum uint64) {
 			toBlock = maxBlock
 		}
 
-		// https://godoc.org/github.com/ethereum/go-ethereum#FilterQuery
-		fq := ethereum.FilterQuery{
-			FromBlock: new(big.Int).SetUint64(fromBlock),
-			ToBlock: new(big.Int).SetUint64(toBlock),
-			Addresses: addrs}
-
+		syncLogs(client, es, fromBlock, toBlock)
 		
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
-
-		t0 := time.Now()
-		logs1, err := client.FilterLogs(ctx, fq)
-		if err != nil {
-			log.Error("ethclient.FilterLogs", "err", err)
-			return
-		}
-		t1 := time.Since(t0)
-		
-		logs = append(logs, logs1...)
-		
-		log.Info("syncEvent", "fromBlock", fromBlock, "toBlock", toBlock, "logs", len(logs1), "total", len(logs), "t", t1)
-
-		for _, l := range logs1 {
-			//log.Info("log", "l", l)
-			
-			args := make([]interface{}, 0)
-			for i, _ := range es.LogTopicNames() {
-				addr := common.HexToAddress(l.Topics[i+1].Hex())
-				args = append(args, addr.Hex())
-			}
-
-			m := make(map[string]interface{})
-			err = contractABI.UnpackIntoMap(m, eventName, l.Data)
-			if err != nil {
-				log.Error("ABI.Unpack", "err", err, "l", l)
-				return
-			}
-			//log.Info("log", "m", m)
-			i := 0
-			for i < len(logDataTypes) {
-				if logDataTypes[i+1] == "address" {
-					a := m[logDataTypes[i]].(common.Address)
-					args = append(args, a.Hex())
-				} else {
-					//f := BigToFloat(m[logDataTypes[i]].(*big.Int))
-					b := m[logDataTypes[i]].(*big.Int)
-					args = append(args, b.Uint64())
-				}
-				i += 2
-			}
-
-			log.Info("args", "len", len(args))
-			ch <- DBExec{insertQuery, args}
-			
-		}
-
 		if toBlock == maxBlock {
 			break
 		}
 	}
 }
+
+func syncLogs(client *ethclient.Client, es *EventSync, fromBlock, toBlock uint64) {
+	addrs := []common.Address{es.ContractAddr}
+	logs := make([]types.Log, 0)
+	
+	// https://godoc.org/github.com/ethereum/go-ethereum#FilterQuery
+	fq := ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(fromBlock),
+		ToBlock: new(big.Int).SetUint64(toBlock),
+		Addresses: addrs}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	t0 := time.Now()
+	logs1, err := client.FilterLogs(ctx, fq)
+	if err != nil {
+		log.Error("ethclient.FilterLogs", "err", err)
+		return
+	}
+	t1 := time.Since(t0)
+	
+	logs = append(logs, logs1...)
+	
+	log.Info("syncEvent", "fromBlock", fromBlock, "toBlock", toBlock, "logs", len(logs1), "total", len(logs), "t", t1)
+
+	for _, l := range logs1 {
+		args := make([]interface{}, 0)
+		args = append(args, l.BlockNumber)
+
+		for i, _ := range es.LogTopicNames {
+			addr := common.HexToAddress(l.Topics[i+1].Hex())
+			args = append(args, addr.Hex())
+		}
+
+		m := make(map[string]interface{})
+		err = es.ContractABI.UnpackIntoMap(m, es.EventName, l.Data)
+		if err != nil {
+			log.Error("ABI.Unpack", "err", err, "es.EventName", es.EventName, "l", l, "abi", *es.ContractABI)
+			return
+		}
+
+		i := 0
+		for i < len(es.LogDataNamesAndTypes) {
+			switch es.LogDataNamesAndTypes[i+1] {
+			case "address":
+				a := m[es.LogDataNamesAndTypes[i]].(common.Address)
+				args = append(args, a.Hex())
+			case "smalluint":
+				b := m[es.LogDataNamesAndTypes[i]].(*big.Int)
+				args = append(args, b.Uint64())
+			case "biguint":
+				b := m[es.LogDataNamesAndTypes[i]].(*big.Int)
+				args = append(args, BigToFloat(b))
+			}
+			i += 2
+		}
+
+		dbExec(es.DBInsertQuery, args)
+	}
+}
+
+
 
 	
 	

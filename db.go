@@ -30,7 +30,9 @@ import (
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-func setupDBConn() *pgxpool.Conn {
+var dbPool *pgxpool.Pool
+
+func initDBPool() {
 	config, err := pgxpool.ParseConfig(dbConnString)
 	if err != nil {
 		log.Error("pgxpool.ParseConfig", "err", err)
@@ -43,66 +45,57 @@ func setupDBConn() *pgxpool.Conn {
 	
 	config.MaxConns = pgxMaxConns
 	
-	dbPool, err := pgxpool.ConnectConfig(context.Background(), config)
+	p, err := pgxpool.ConnectConfig(context.Background(), config)
 	if err != nil {
 		log.Error("pgxpool.Connect", "err", err)
 		panic(err)
 	} else {
+		dbPool = p
 		log.Info("pgxpool.Connect OK")
 	}
-	
-	dbConn, err := dbPool.Acquire(context.Background())
+}
+
+func dbExec(sql string, args []interface{}) {
+	//t0 := time.Now()
+	_, err := dbPool.Exec(context.Background(), sql, args...)
 	if err != nil {
-		log.Error("pgxpool.Pool.Acquire", "err", err)
-		panic(err)
+		log.Error("dbConn.Exec", "err", err)
+		return
 	}
-
-	return dbConn
+	//t1 := time.Since(t0)
+	//log.Info("dbConn.Exec OK", "cmdtag", cmdTag, "t", t1)
 }
 
-type DBExec struct {
-	sql string
-	args []interface{}
-}
-
-func dbHandler(dbConn *pgxpool.Conn, ch <-chan DBExec) {
-	for e := range ch {
-		t0 := time.Now()
-		cmdTag, err := dbConn.Exec(context.Background(), e.sql, e.args...)
-		if err != nil {
-			log.Error("dbConn.Exec", "err", err)
-		} else {
-			t1 := time.Since(t0)
-			log.Info("dbConn.Exec OK", "cmdtag", cmdTag, "t", t1)
-		}
-	}
-	
-	dbConn.Release()
-}
-
-func insertTransfer(dbConn *pgxpool.Conn, pair UniswapPair, ts uint64, tx_hash, from, to string, value *big.Int) {
-	//log.Info("insertTransfer", "dbConn.IsClosed()", dbConn.IsClosed())
-	table := pair.DBTableName("transfer")
-	q := "INSERT INTO " + table + " (timestamp, tx_hash, from_addr, to_addr, value) VALUES ($1, $2, $3, $4, $5)"
-	cmdTag, err := dbConn.Exec(context.Background(), q, ts, tx_hash, from, to, BigToFloat(value))
+func dbQueryUint64(sql string, args []interface{}) uint64 {
+	t0 := time.Now()
+	rows, err := dbPool.Query(context.Background(), sql, args...)
 	if err != nil {
 		log.Error("dbConn.Query", "err", err)
 		panic(err)
-	} else {
-		log.Info("query OK", "table", table, "cmdtag", cmdTag)
 	}
-}
+	defer rows.Close()
+	t1 := time.Since(t0)
+	log.Info("dbConn.Query OK", "t", t1)
 
-func insertSwap(dbConn *pgxpool.Conn, pair UniswapPair, ts uint64, tx_hash, from, to string, a0In, a1In, a0Out, a1Out *big.Int) {
-	table := pair.DBTableName("swap")
-	q := "INSERT INTO " + table + " (timestamp, tx_hash, from_addr, to_addr, amount_0_in, amount_1_in, amount_0_out, amount_1_out) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-	cmdTag, err := dbConn.Exec(context.Background(), q, ts, tx_hash, from, to, BigToFloat(a0In), BigToFloat(a1In), BigToFloat(a0Out), BigToFloat(a1Out))
-	if err != nil {
-		log.Error("dbConn.Query", "err", err)
-		panic(err)
-	} else {
-		log.Info("query OK", "table", table, "cmdtag", cmdTag)
+	// empty table
+	if !rows.Next() {
+		return 0
 	}
+
+	var block uint64
+	err = rows.Scan(&block)
+	if err != nil {
+		log.Error("rows.Scan", "err", err)
+		panic(err)
+	}
+	
+	// Any errors encountered by rows.Next or rows.Scan will be returned here
+	if rows.Err() != nil {
+		log.Error("rows.Err", "err", err)
+		panic(err)
+	}
+
+	return block
 }
 
 // TODO: this is just for testing; remove when moving to postgresql numeric
