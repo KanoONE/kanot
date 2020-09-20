@@ -59,7 +59,7 @@ func dbExec(sql string, args []interface{}) {
 	//t0 := time.Now()
 	_, err := dbPool.Exec(context.Background(), sql, args...)
 	if err != nil {
-		log.Error("dbConn.Exec", "err", err)
+		log.Error("dbConn.Exec", "err", err, "sql", sql, "args", args)
 		return
 	}
 	//t1 := time.Since(t0)
@@ -96,6 +96,46 @@ func dbQueryUint64(sql string, args []interface{}) uint64 {
 	}
 
 	return block
+}
+
+type USV2PairCreated struct {
+	ticker string
+	block uint64
+	tx_hash string
+	token0, token1, pair_addr string
+	pair_id uint64
+}
+func dbQueryPairsCreated(sql string, args []interface{}) []*USV2PairCreated {
+	t0 := time.Now()
+	rows, err := dbPool.Query(context.Background(), sql, args...)
+	if err != nil {
+		log.Error("dbConn.Query", "err", err)
+		panic(err)
+	}
+	defer rows.Close()
+	t1 := time.Since(t0)
+	log.Info("dbConn.Query OK", "t", t1)
+
+	pairs := []*USV2PairCreated{}
+	for rows.Next() {
+		var block, pair_id uint64
+		var ticker, tx_hash, token0, token1, pair_addr string
+		err = rows.Scan(&ticker, &block, &tx_hash, &token0, &token1, &pair_addr, &pair_id)
+		if err != nil {
+			log.Error("rows.Scan", "err", err)
+			panic(err)
+		}
+		pair := USV2PairCreated{ticker, block, tx_hash, token0, token1, pair_addr, pair_id}
+		pairs = append(pairs, &pair)
+	}
+
+	// Any errors encountered by rows.Next or rows.Scan will be returned here
+	if rows.Err() != nil {
+		log.Error("rows.Err", "err", err)
+		panic(err)
+	}
+
+	return pairs
 }
 
 // TODO: this is just for testing; remove when moving to postgresql numeric

@@ -29,11 +29,7 @@ import (
 )
 
 func init() {
-	log.Root().SetHandler(log.MultiHandler(
-		log.StreamHandler(os.Stderr, log.TerminalFormat(true)),
-		log.LvlFilterHandler(
-			log.LvlInfo,
-			log.Must.FileHandler("kanot_errors.json", log.JSONFormat()))))
+	kanot.InitLog()
 }
 
 func main() {
