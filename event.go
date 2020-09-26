@@ -20,7 +20,10 @@ package kanot
 
 import (
 	"strings"
+	"strconv"
 	//"math/big"
+
+	"github.com/jackc/pgx/v4/pgxpool"
 
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/common"
@@ -31,32 +34,33 @@ import (
 
 type ContractSync interface {
 	Name() string
-	Contract() (common.Address, uint64, abi.ABI)
+	Contract() (common.Address, uint64, *abi.ABI)
 
 	EventName([]common.Hash) string
 	LogFields(string) ([]string, []string)
 
-	DBLastInsertedBlock() uint64
-	DBInsert(*ethclient.Client, *types.Log, []interface{})
+	LastInsertedBlock(*pgxpool.Conn) uint64
+	Insert(*pgxpool.Conn, *ethclient.Client, types.Log, []interface{})
 }
 
 // https://uniswap.org/docs/v2/smart-contracts/factory/
 // event PairCreated(address indexed token0, address indexed token1, address pair, uint);
 type GlueUSV2Factory struct {
 	dbTableName string
+	contractABI *abi.ABI
 }
 
 func NewGlueUSV2Factory() *GlueUSV2Factory {
-	return &GlueUSV2Factory{"us_factory"}
+	a := loadABI(uniswapFactoryABI)
+	return &GlueUSV2Factory{"us_factory", &a}
 }
 
 func (s *GlueUSV2Factory) Name() string {
 	return "USV2Factory"
 }
 
-func (s *GlueUSV2Factory) Contract() (common.Address, uint64, abi.ABI) {
-	a := loadABI(uniswapFactoryABI)
-	return common.HexToAddress(uniswapFactoryAddr), uniswapFactoryCreateBlock, a
+func (s *GlueUSV2Factory) Contract() (common.Address, uint64, *abi.ABI) {
+	return common.HexToAddress(uniswapFactoryAddr), uniswapFactoryCreateBlock, s.contractABI
 }
 
 func (s *GlueUSV2Factory) EventName(topics []common.Hash) string {
@@ -69,22 +73,30 @@ func (s *GlueUSV2Factory) LogFields(eventName string) ([]string, []string) {
 	return tn, dnt
 }
 
-func (s *GlueUSV2Factory) DBLastInsertedBlock() uint64 {
+func (s *GlueUSV2Factory) LastInsertedBlock(dbConn *pgxpool.Conn) uint64 {
 	q := "SELECT block FROM " + s.dbTableName + " ORDER BY block DESC LIMIT 1"
-	return dbQueryUint64(q, []interface{}{})
+	return dbQueryUint64(dbConn, q, []interface{}{})
 }
 
-func (s *GlueUSV2Factory) DBInsert(ec *ethclient.Client, l *types.Log, args []interface{}) {
+func (s *GlueUSV2Factory) Insert(dbConn *pgxpool.Conn, ec *ethclient.Client, l types.Log, args []interface{}) {
 	tokenAddr0, tokenAddr1 := args[2].(string), args[3].(string)
-	pairSymbol := getSymbol(ec, tokenAddr0) + "" + getSymbol(ec, tokenAddr1)
-	q := "INSERT INTO " + s.dbTableName + " (pair, block, tx_hash, token0, token1, pair_addr, pair_id) VALUES ('" + pairSymbol + "', $1, $2, $3, $4, $5, $6)"
-	dbExec(q, args)
+	pairTicker := getTicker(dbConn, ec, tokenAddr0, tokenAddr1)
+	//log.Info("pairTicker duplicate", "new", pairTicker1, "t0", tokenAddr0, "t1", tokenAddr1)
+	q1 := "INSERT INTO " + s.dbTableName + " (pair, block, tx_hash, token0, token1, pair_addr, pair_id) VALUES ('" + pairTicker + "', $1, $2, $3, $4, $5, $6)"
+	dbExec(dbConn, q1, args)
+}
+
+func getTicker(dbConn *pgxpool.Conn, ec *ethclient.Client, t0, t1 string) string {
+	pairTicker0 := getSymbol(ec, t0) + "-" + getSymbol(ec, t1)
+	q0 := "SELECT pair FROM us_factory WHERE pair LIKE '" + pairTicker0 + "%'"
+	tickers := dbQueryPairTickers(dbConn, q0)
+	return pairTicker0 + "-" + strconv.Itoa(len(tickers))
 }
 
 // https://uniswap.org/docs/v2/smart-contracts/pair/
 type GlueUSV2Pair struct {
 	contractAddr common.Address
-	contractABI abi.ABI
+	contractABI *abi.ABI
 	createBlock uint64
 	pairTicker string
 	dbTableBase string
@@ -94,7 +106,7 @@ func NewGlueUSV2Pair(addr common.Address, block uint64, ticker string) *GlueUSV2
 	a := loadABI(uniswapPairABI)
 	return &GlueUSV2Pair{
 		contractAddr: addr,
-		contractABI: a,
+		contractABI: &a,
 		createBlock: block,
 		pairTicker: ticker,
 		dbTableBase: "us_pair_",
@@ -105,7 +117,7 @@ func (s *GlueUSV2Pair) Name() string {
 	return "USV2Pair_" + s.pairTicker
 }
 
-func (s *GlueUSV2Pair) Contract() (common.Address, uint64, abi.ABI) {
+func (s *GlueUSV2Pair) Contract() (common.Address, uint64, *abi.ABI) {
 	return s.contractAddr, s.createBlock, s.contractABI
 }
 
@@ -127,7 +139,7 @@ func (s *GlueUSV2Pair) EventName(topics []common.Hash) string {
 func (s *GlueUSV2Pair) LogFields(eventName string) ([]string, []string) {
 	// TODO: refactor this: unnamed args, use ABI types
 	tn, dnt := []string{}, []string{}
-	
+
 	switch eventName {
 	case "Mint":
 		tn = append(tn, "sender")
@@ -147,17 +159,17 @@ func (s *GlueUSV2Pair) LogFields(eventName string) ([]string, []string) {
 		dnt = append(dnt, "value", "biguint")
 	case "Transfer":
 		tn = append(tn, "from", "to")
-		dnt = append(dnt, "value", "biguint")		
+		dnt = append(dnt, "value", "biguint")
 	}
 
 	return tn, dnt
 }
 
-func (s *GlueUSV2Pair) DBLastInsertedBlock() uint64 {
+func (s *GlueUSV2Pair) LastInsertedBlock(dbConn *pgxpool.Conn) uint64 {
 	getBlock := func(eventName string) uint64 {
 		q := "SELECT block FROM " + s.dbTableBase + eventName +
 			" WHERE pair = '" + s.pairTicker + "' ORDER BY block DESC LIMIT 1"
-		return dbQueryUint64(q, []interface{}{})
+		return dbQueryUint64(dbConn, q, []interface{}{})
 	}
 
 	blocks := []uint64{
@@ -177,10 +189,10 @@ func (s *GlueUSV2Pair) DBLastInsertedBlock() uint64 {
 	return last
 }
 
-func (s *GlueUSV2Pair) DBInsert(ec *ethclient.Client, l *types.Log, args []interface{}) {
+func (s *GlueUSV2Pair) Insert(dbConn *pgxpool.Conn, ec *ethclient.Client, l types.Log, args []interface{}) {
 	eventName := s.EventName(l.Topics)
 	insertQuery := "INSERT INTO " + s.dbTableBase + eventName + " (pair, block, tx_hash, "
-	
+
 	switch eventName {
 	case "Mint":
 		insertQuery += ("sender, amount0, amount1) VALUES ('"+ s.pairTicker + "', $1, $2, $3, $4, $5)")
@@ -196,7 +208,7 @@ func (s *GlueUSV2Pair) DBInsert(ec *ethclient.Client, l *types.Log, args []inter
 		insertQuery += ("sender, dest, value) VALUES ('" + s.pairTicker + "', $1, $2, $3, $4, $5)")
 	}
 
-	dbExec(insertQuery, args)
+	dbExec(dbConn, insertQuery, args)
 }
 
 

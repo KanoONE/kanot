@@ -23,9 +23,10 @@ import (
 	"math"
 	"math/big"
 	"time"
-	
+
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	
+
 	//"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -38,13 +39,13 @@ func initDBPool() {
 		log.Error("pgxpool.ParseConfig", "err", err)
 		panic(err)
 	}
-	
+
 	hours, _ := time.ParseDuration(pgxMaxConnTime)
 	config.MaxConnLifetime = hours
 	config.MaxConnIdleTime = hours
-	
+
 	config.MaxConns = pgxMaxConns
-	
+
 	p, err := pgxpool.ConnectConfig(context.Background(), config)
 	if err != nil {
 		log.Error("pgxpool.Connect", "err", err)
@@ -55,9 +56,9 @@ func initDBPool() {
 	}
 }
 
-func dbExec(sql string, args []interface{}) {
+func dbExec(dbConn *pgxpool.Conn, sql string, args []interface{}) {
 	//t0 := time.Now()
-	_, err := dbPool.Exec(context.Background(), sql, args...)
+	_, err := dbConn.Exec(context.Background(), sql, args...)
 	if err != nil {
 		log.Error("dbConn.Exec", "err", err, "sql", sql, "args", args)
 		return
@@ -66,16 +67,16 @@ func dbExec(sql string, args []interface{}) {
 	//log.Info("dbConn.Exec OK", "cmdtag", cmdTag, "t", t1)
 }
 
-func dbQueryUint64(sql string, args []interface{}) uint64 {
-	t0 := time.Now()
-	rows, err := dbPool.Query(context.Background(), sql, args...)
+func dbQueryUint64(dbConn *pgxpool.Conn, sql string, args []interface{}) uint64 {
+	//t0 := time.Now()
+	rows, err := dbConn.Query(context.Background(), sql, args...)
 	if err != nil {
 		log.Error("dbConn.Query", "err", err)
 		panic(err)
 	}
 	defer rows.Close()
-	t1 := time.Since(t0)
-	log.Info("dbConn.Query OK", "t", t1)
+	//t1 := time.Since(t0)
+	//log.Info("dbConn.Query OK", "t", t1)
 
 	// empty table
 	if !rows.Next() {
@@ -88,7 +89,7 @@ func dbQueryUint64(sql string, args []interface{}) uint64 {
 		log.Error("rows.Scan", "err", err)
 		panic(err)
 	}
-	
+
 	// Any errors encountered by rows.Next or rows.Scan will be returned here
 	if rows.Err() != nil {
 		log.Error("rows.Err", "err", err)
@@ -105,16 +106,16 @@ type USV2PairCreated struct {
 	token0, token1, pair_addr string
 	pair_id uint64
 }
-func dbQueryPairsCreated(sql string, args []interface{}) []*USV2PairCreated {
-	t0 := time.Now()
-	rows, err := dbPool.Query(context.Background(), sql, args...)
+func dbQueryPairsCreated(dbConn *pgxpool.Conn, sql string, args []interface{}) []*USV2PairCreated {
+	//t0 := time.Now()
+	rows, err := dbConn.Query(context.Background(), sql, args...)
 	if err != nil {
 		log.Error("dbConn.Query", "err", err)
 		panic(err)
 	}
 	defer rows.Close()
-	t1 := time.Since(t0)
-	log.Info("dbConn.Query OK", "t", t1)
+	//t1 := time.Since(t0)
+	//log.Info("dbConn.Query OK", "t", t1)
 
 	pairs := []*USV2PairCreated{}
 	for rows.Next() {
@@ -136,6 +137,60 @@ func dbQueryPairsCreated(sql string, args []interface{}) []*USV2PairCreated {
 	}
 
 	return pairs
+}
+
+func dbQueryPairTickers(dbConn *pgxpool.Conn, sql string) []string {
+	rows, err := dbConn.Query(context.Background(), sql)
+	if err != nil {
+		log.Error("dbConn.Query", "err", err)
+		panic(err)
+	}
+	defer rows.Close()
+
+	res := []string{}
+	for rows.Next() {
+		var ticker string
+		err := rows.Scan(&ticker)
+		if err != nil {
+			log.Error("rows.Scan", "err", err)
+			panic(err)
+		}
+		res = append(res, ticker)
+	}
+
+	if rows.Err() != nil {
+		log.Error("rows.Err", "err", err)
+		panic(err)
+	}
+
+	return res
+}
+
+func dbQueryAddrs(dbConn *pgxpool.Conn, sql string) []common.Address {
+	rows, err := dbConn.Query(context.Background(), sql)
+	if err != nil {
+		log.Error("dbConn.Query", "err", err)
+		panic(err)
+	}
+	defer rows.Close()
+
+	res := []common.Address{}
+	for rows.Next() {
+		var addr string
+		err := rows.Scan(&addr)
+		if err != nil {
+			log.Error("rows.Scan", "err", err)
+			panic(err)
+		}
+		res = append(res, common.HexToAddress(addr))
+	}
+
+	if rows.Err() != nil {
+		log.Error("rows.Err", "err", err)
+		panic(err)
+	}
+
+	return res
 }
 
 // TODO: this is just for testing; remove when moving to postgresql numeric

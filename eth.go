@@ -21,18 +21,23 @@ package kanot
 import (
 	"context"
 	"time"
+	//"math"
 	"math/big"
 	//"encoding/hex"
 	"strings"
 	"os"
-	
+	//"sync"
+
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/common"
-	//"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	//"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v4/pgxpool"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 const (
@@ -43,7 +48,7 @@ const (
 	endpoint = "ws://127.0.0.1:13516"
 
 	// number of blocks for high guarantee of no reorgs
-	blockConfirmations = 30 // around 6 minutes
+	blockConfirmations = 15
 
 	//
 	// PostgreSQL
@@ -54,16 +59,15 @@ const (
 	// TODO: for now set high so conns are open indefinitely
 	pgxMaxConnTime = "876000h" // 100 years
 
-	// TODO: increase when we implement concurrent inserts
-	pgxMaxConns = 1
+	pgxMaxConns = 6
 
 	//
 	// Performance Tuning
 	//
-	pollingCycle = 600 * time.Second
-	
-	queryBlockCount = 2048 //6646*1 // ~1 day worth of blocks
-	queryTimeout = 120 * time.Second
+	pollingCycle = 300 * time.Second
+	queryBlockCount = 32
+	queryTimeout = 240 * time.Second
+	syncWorkers = 1
 )
 
 func InitLog() {
@@ -74,139 +78,202 @@ func InitLog() {
 }
 
 func SyncETH() {
-	initDBPool()
-	
-	contractSyncs := []ContractSync{
-		//NewGlueUSV2Factory(),
-	}
+	go func() {
+		err := http.ListenAndServe("localhost:6060", nil)
+		if err != nil {
+			log.Error("http.ListenAndServe", "err", err)
+		}
+	}()
 
-	for _, cs := range contractSyncs {
-		go func() {
-			for {
-				//log.Info("Syncing", "eventName", es.EventName)
-				syncContract(cs)
-				time.Sleep(pollingCycle)
-			}
-		}()
-	}
-	
-	go syncUSV2Pairs()
+	initDBPool()
+
+	syncUniswap()
 }
 
-func syncContract(cs ContractSync) {
-	_, createBlock, _ := cs.Contract()
-	lastInsertedBlock := cs.DBLastInsertedBlock()
+func syncUniswap() {
+	ec := getETHClient()
+	dbConn := getDBConn()
+	usf := NewGlueUSV2Factory()
+	usfAddr, usfCreateBlock, _ := usf.Contract()
 
-	// Re-init log to avoid trace log level in go-ethereum/eth/handler.go
-	//InitLog()
-	
-	client, err := ethclient.Dial(endpoint)
-	if err != nil {
-     	log.Error("rpc.Dial", "err", err)
+	addrs := []common.Address{usfAddr}
+	csm := make(map[common.Address]ContractSync)
+	csm[usfAddr] = usf
+
+	q := "SELECT * FROM us_factory ORDER BY block DESC"
+	pairs := dbQueryPairsCreated(dbConn, q, []interface{}{})
+
+	for _, p := range pairs {
+		addr := common.HexToAddress(p.pair_addr)
+		addrs = append(addrs, addr)
+		cs := NewGlueUSV2Pair(addr, p.block, p.ticker)
+		csm[addr] = cs
+	}
+
+	fromBlock := usfCreateBlock
+	if len(pairs) > 0 {
+		fromBlock = pairs[0].block
+	}
+
+	headBlock, _ := getHeadBlockAndTime(ec)
+	maxBlock := headBlock - blockConfirmations
+
+	if fromBlock > maxBlock {
+		log.Info("up-to-date before sync", "fromBlock", fromBlock, "headBlock", headBlock, "pairs", len(pairs))
 		return
 	}
 
-	latestHeader, err := client.HeaderByNumber(context.Background(), nil)
-	if err != nil {
-		log.Error("client.HeaderByNumber", "err", err)
-		return
-	}
-	
-	var fromBlock, toBlock uint64
-	maxBlock := latestHeader.Number.Uint64() - blockConfirmations
+	log.Info("syncing", "fromBlock", fromBlock, "maxBlock", maxBlock, "pairs", len(pairs))
 
-	// toBlock is used as fromBlock in first iteration
-	if lastInsertedBlock == 0 {
-		toBlock = createBlock - 1
-	} else {
-		toBlock = lastInsertedBlock
+	getLogs := func(fb, tb uint64, as []common.Address) ([]types.Log, time.Duration) {
+		fq := ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(fb),
+			ToBlock: new(big.Int).SetUint64(tb),
+			Addresses: as}
+		t0 := time.Now()
+		logs, err := ec.FilterLogs(context.Background(), fq)
+		if err != nil {
+			log.Error("ethclient.FilterLogs", "err", err)
+			panic(err)
+		}
+		return logs, time.Since(t0)
 	}
-	
+
+	var toBlock uint64
 	for {
-		fromBlock = toBlock + 1
 		toBlock = fromBlock + queryBlockCount
 		if toBlock > maxBlock {
 			toBlock = maxBlock
 		}
 
-		syncLogs(client, cs, fromBlock, toBlock)
-		
-		if toBlock == maxBlock {
-			break
+		logs, t1 := getLogs(fromBlock, toBlock, addrs)
+		t2 := time.Now()
+		fLogs := []types.Log{}
+		for _, l := range logs {
+			if l.Address == usfAddr {
+				fLogs = append(fLogs, l)
+			} else {
+				// Insert all pair logs
+				cs := csm[l.Address]
+				args := parseLog(l, cs)
+				cs.Insert(dbConn, ec, l, args)
+			}
 		}
-	}
-}
+		t3 := time.Since(t2)
 
-func syncLogs(client *ethclient.Client, cs ContractSync, fromBlock, toBlock uint64) {
-	contractAddr, _, contractABI := cs.Contract()
-	addrs := []common.Address{contractAddr}
-	
-	// https://godoc.org/github.com/ethereum/go-ethereum#FilterQuery
-	fq := ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(fromBlock),
-		ToBlock: new(big.Int).SetUint64(toBlock),
-		Addresses: addrs}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-	defer cancel()
+		log.Info("sync", "fromBlock", fromBlock, "left", maxBlock-fromBlock, "addrs", len(addrs), "logs", len(logs), "fl", t1, "in", t3)
 
-	t0 := time.Now()
-	logs1, err := client.FilterLogs(ctx, fq)
-	if err != nil {
-		log.Error("ethclient.FilterLogs", "err", err)
-		return
-	}
-	t1 := time.Since(t0)
-	
-	log.Info("syncLogs", "name", cs.Name(), "fromBlock", fromBlock, "toBlock", toBlock, "logs", len(logs1), "t", t1)
+		// If we have factory logs, parse out new pair addresses,
+		// get their logs and insert them.
+		if len(fLogs) > 0 {
+			npAddrs := []common.Address{}
+			for _, fl := range fLogs {
+				args := parseLog(fl, usf)
+				t0, t1, a := args[2].(string), args[3].(string), args[4].(string)
+				pa := common.HexToAddress(a)
+				ticker := getTicker(dbConn, ec, t0, t1)
+				cs := NewGlueUSV2Pair(pa, fl.BlockNumber, ticker)
+				csm[pa] = cs
+				npAddrs = append(npAddrs, pa)
+			}
+			addrs = append(addrs, npAddrs...)
 
-	for _, l := range logs1 {
-		args := make([]interface{}, 0)
-		args = append(args, l.BlockNumber, l.TxHash.Hex())
+			pLogs, t4 := getLogs(fromBlock, toBlock, npAddrs)
+			t5 := time.Now()
+			for _, l := range pLogs {
+				cs := csm[l.Address]
+				args := parseLog(l, cs)
+				cs.Insert(dbConn, ec, l, args)
+			}
+			t6 := time.Since(t5)
 
-		eventName := cs.EventName(l.Topics)
-		tn, dnt := cs.LogFields(eventName)
-		
-		for i, _ := range tn {
-			addr := common.HexToAddress(l.Topics[i+1].Hex())
-			args = append(args, addr.Hex())
+			log.Info("re-sync new pairs", "fromBlock", fromBlock, "newPairs", len(npAddrs), "fl", t4, "in", t6)
+			// Insert factory logs last, so that if committed to DB we
+			// know that all pair logs in the block range are also committed.
+			// This can be safely used to initialize the address set
+			// on arbitrary sync restarts.
+			for _, l := range fLogs {
+				args := parseLog(l, usf)
+				usf.Insert(dbConn, ec, l, args)
+			}
 		}
 
-		m := make(map[string]interface{})
-		err = contractABI.UnpackIntoMap(m, eventName, l.Data)
-		if err != nil {
-			log.Error("ABI.Unpack", "err", err, "es.EventName", eventName, "l", l, "abi", contractABI)
+		fromBlock = fromBlock + queryBlockCount + 1
+		if fromBlock > maxBlock {
+			log.Info("up-to-date after sync", "fromBlock", fromBlock, "headBlock", headBlock)
 			return
 		}
-
-		i := 0
-		for i < len(dnt) {
-			switch dnt[i+1] {
-			case "address":
-				a := m[dnt[i]].(common.Address)
-				args = append(args, a.Hex())
-			case "smalluint":
-				b := m[dnt[i]].(*big.Int)
-				args = append(args, b.Uint64())
-			case "biguint":
-				b := m[dnt[i]].(*big.Int)
-				args = append(args, BigToFloat(b))
-			}
-			i += 2
-		}
-
-		cs.DBInsert(client, &l, args)
 	}
 }
 
-func syncUSV2Pairs() {
-	q := "SELECT * FROM us_factory ORDER BY block ASC LIMIT 1"
-	pairs := dbQueryPairsCreated(q, []interface{}{})
-	log.Info("syncUSV2Pairs", "pairs", len(pairs), "first", pairs[0])
+func parseLog(l types.Log, cs ContractSync) []interface{} {
+	_, _, cABI := cs.Contract()
+	eventName := cs.EventName(l.Topics)
+	tn, dnt := cs.LogFields(eventName)
 
-	glue := NewGlueUSV2Pair(common.HexToAddress(pairs[0].pair_addr), pairs[0].block, pairs[0].ticker)
-	syncContract(glue)
-	
+	args := make([]interface{}, 0)
+	args = append(args, l.BlockNumber, l.TxHash.Hex())
+
+	for i, _ := range tn {
+		addr := common.HexToAddress(l.Topics[i+1].Hex())
+		args = append(args, addr.Hex())
+	}
+
+	m := make(map[string]interface{})
+	err := cABI.UnpackIntoMap(m, eventName, l.Data)
+	if err != nil {
+		log.Error("ABI.Unpack", "err", err, "en", eventName, "l", l, "abi", cABI)
+		panic(err)
+	}
+
+	// TODO: use types / direct decoding from ABI
+	i := 0
+	for i < len(dnt) {
+		switch dnt[i+1] {
+		case "address":
+			a := m[dnt[i]].(common.Address)
+			args = append(args, a.Hex())
+		case "smalluint":
+			b := m[dnt[i]].(*big.Int)
+			args = append(args, b.Uint64())
+		case "biguint":
+			b := m[dnt[i]].(*big.Int)
+			args = append(args, b.String())
+		}
+		i += 2
+	}
+
+	return args
+}
+
+func getDBConn() *pgxpool.Conn {
+	dbConn, err := dbPool.Acquire(context.Background())
+	if err != nil {
+		log.Error("dbPool.Acquire", "err", err)
+		panic(err)
+	}
+	return dbConn
+}
+
+func getETHClient() *ethclient.Client {
+	c, err := ethclient.Dial(endpoint)
+	if err != nil {
+     	log.Error("rpc.Dial", "err", err)
+		panic(err)
+	}
+	return c
+}
+
+func getHeadBlockAndTime(c *ethclient.Client) (uint64, time.Time) {
+	lastHeader, err := c.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		log.Error("client.HeaderByNumber", "err", err)
+		panic(err)
+	}
+
+	headBlock := lastHeader.Number.Uint64()
+	t := time.Unix(int64(lastHeader.Time), 0)
+	return headBlock, t
 }
 
 func getSymbol(ec *ethclient.Client, addr string) string {
@@ -216,7 +283,7 @@ func getSymbol(ec *ethclient.Client, addr string) string {
 		log.Error("NewUSV2Pair", "err", err)
 		panic(err)
 	}
-	
+
 	symbol, err := c0.Symbol(nil)
 	if err != nil {
 		// Try DSToken (MKR et al)
@@ -225,7 +292,7 @@ func getSymbol(ec *ethclient.Client, addr string) string {
 			log.Error("NewDSToken", "err", err0)
 			panic(err0)
 		}
-		
+
 		symbol, err1 := c1.Symbol(nil)
 		if err1 != nil {
 			switch addr {
